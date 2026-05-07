@@ -1,0 +1,59 @@
+# Default configuration for diabetes VAE project
+
+# Data configuration
+data:
+  cgm_resolution: 5           # minutes between CGM readings
+  cgm_readings_per_day: 288   # 24 hours * 60 / 5
+  dataset_split:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+
+# Model configuration
+model:
+  latent_dim: 8
+  cgm_seq_length: 288
+  insulin_seq_length: 288
+  
+  # Encoder architecture
+  cgm_encoder_channels: [16, 32, 64]
+  cgm_encoder_kernel_size: 3
+  cgm_encoder_stride: 1
+  cgm_encoder_padding: 1
+  
+  # Decoder architecture
+  cgm_decoder_channels: [64, 32, 16]
+  
+  # Multimodal VAE
+  use_product_of_experts: true
+  missing_modality_handling: "drop"  # or "zero"
+
+# Training configuration
+training:
+  batch_size: 32
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  
+  # KL annealing
+  kl_annealing_enabled: true
+  kl_warmup_epochs: 10
+  
+  # Regularization
+  kl_weight: 1.0
+  reconstruction_weight: 1.0
+  
+  # Device
+  device: "cuda"
+  num_workers: 4
+  
+  # Checkpointing
+  checkpoint_freq: 5  # epochs
+  save_dir: "models"
+
+# Evaluation configuration
+eval:
+  umap_n_neighbors: 15
+  umap_min_dist: 0.1
+  plot_missing_modality_combos: true
+  reconstruction_threshold: 0.1
