@@ -160,37 +160,94 @@ class OhioT1DMDataset(Dataset):
 
 class MetaboNetDataset(Dataset):
     """
-    Placeholder for MetaboNet dataset loading.
-    Available at: metabo-net.org
+    MetaboNet dataset: patient-day samples from preprocessed numpy arrays.
+
+    Run scripts/preprocess_metabonet.py once to build data/processed/{split}/ from
+    the raw train.parquet / test.parquet files.
+
+    Each sample:
+      cgm        (288,)  glucose mg/dL at 5-min intervals, linearly interpolated
+      insulin    (288,)  total insulin units at 5-min intervals
+      physiology (5,)    daily summaries: HR_mean, steps_sum, GSR_mean,
+                         skin_temp_mean, calories_sum
     """
-    
-    def __init__(self, data_dir: str, split: str = "train"):
+
+    PHYSIOLOGY_FEATURES = [
+        'heartrate', 'steps', 'galvanic_skin_response', 'skin_temp', 'calories_burned'
+    ]
+
+    def __init__(self, processed_dir: str, split: str = "train", normalize: bool = True):
         """
         Args:
-            data_dir: path to MetaboNet data directory
-            split: "train", "val", or "test"
+            processed_dir: path to data/processed/
+            split: "train" or "test"
+            normalize: apply StandardScaler per modality
         """
-        self.data_dir = Path(data_dir)
+        self.split_dir = Path(processed_dir) / split
         self.split = split
-        
-        if not self.data_dir.exists():
+        self.normalize = normalize
+
+        if not self.split_dir.exists():
             raise FileNotFoundError(
-                f"MetaboNet data directory not found: {self.data_dir}\n"
-                "Please download from metabo-net.org"
+                f"Processed data not found: {self.split_dir}\n"
+                "Run: python scripts/preprocess_metabonet.py"
             )
-        
-        # TODO: Implement actual data loading
+
         self._load_data()
-    
+
+        self.modalities = ['cgm', 'insulin', 'physiology']
+        self.scalers: Dict = {}
+        if normalize:
+            self._fit_scalers()
+
     def _load_data(self):
-        """Load MetaboNet data from disk."""
-        raise NotImplementedError("MetaboNet data loading not yet implemented")
-    
+        self.cgm_data       = np.load(self.split_dir / 'cgm.npy',        mmap_mode='r')
+        self.insulin_data   = np.load(self.split_dir / 'insulin.npy',    mmap_mode='r')
+        self.physiology_data = np.load(self.split_dir / 'physiology.npy', mmap_mode='r')
+        self.metadata       = pd.read_parquet(self.split_dir / 'metadata.parquet')
+        self.n_samples      = len(self.cgm_data)
+
+    def _fit_scalers(self):
+        # Copy small slice into RAM for fitting scalers; mmap stays on disk
+        cgm_fit = np.array(self.cgm_data, dtype=np.float32)
+        ins_fit = np.array(self.insulin_data, dtype=np.float32)
+        phy_fit = np.array(self.physiology_data, dtype=np.float32)
+
+        # Physiology has NaN for missing wearable days — fit on observed only
+        phy_obs = phy_fit[~np.isnan(phy_fit).any(axis=1)]
+
+        self.scalers['cgm'] = StandardScaler().fit(cgm_fit)
+        self.scalers['insulin'] = StandardScaler().fit(ins_fit)
+        if len(phy_obs):
+            self.scalers['physiology'] = StandardScaler().fit(phy_obs)
+
     def __len__(self) -> int:
-        raise NotImplementedError()
-    
+        return self.n_samples
+
     def __getitem__(self, idx: int) -> Dict:
-        raise NotImplementedError()
+        cgm = np.array(self.cgm_data[idx], dtype=np.float32)
+        if self.normalize and 'cgm' in self.scalers:
+            cgm = self.scalers['cgm'].transform(cgm.reshape(-1, 1)).flatten()
+
+        insulin = np.array(self.insulin_data[idx], dtype=np.float32)
+        if self.normalize and 'insulin' in self.scalers:
+            insulin = self.scalers['insulin'].transform(insulin.reshape(-1, 1)).flatten()
+
+        phys = np.array(self.physiology_data[idx], dtype=np.float32)
+        if self.normalize and 'physiology' in self.scalers:
+            if not np.isnan(phys).any():
+                phys = self.scalers['physiology'].transform(phys.reshape(1, -1)).flatten()
+            else:
+                phys = np.zeros_like(phys)  # missing wearable day → zero vector
+
+        row = self.metadata.iloc[idx]
+        return {
+            'cgm':        torch.from_numpy(cgm),
+            'insulin':    torch.from_numpy(insulin),
+            'physiology': torch.from_numpy(phys),
+            'patient_id': row['patient_id'],
+            'date':       row['date'],
+        }
 
 
 def create_dummy_dataset(n_samples: int = 100,

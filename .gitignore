@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data — raw parquet databases and preprocessed arrays
+data/*.parquet
+data/*.csv
+data/processed/
+
+# Trained model checkpoints and experiment outputs
+models/
+experiments/
+results/

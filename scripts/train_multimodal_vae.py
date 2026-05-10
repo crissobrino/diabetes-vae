@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 import torch
 from torch.utils.data import DataLoader, random_split
 from config import Config
-from dataset import create_dummy_dataset
+from dataset import MetaboNetDataset
 from models import MultimodalVAEWithPoE
 from training import VAETrainer
 from utils import set_seed, print_model_info, get_device, create_experiment_dir
@@ -29,18 +29,19 @@ def main():
     
     print(f"Experiment directory: {exp_dir}")
     
-    # Create dummy dataset (replace with real data loading)
     print("Loading dataset...")
-    dataset = create_dummy_dataset(n_samples=200, n_physiology_features=5)
-    
-    # Split into train/val/test
-    train_size = int(0.7 * len(dataset))
-    val_size = int(0.15 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
-    
-    train_loader = DataLoader(train_set, batch_size=config.training.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=config.training.batch_size, shuffle=False)
+    train_set = MetaboNetDataset(processed_dir='data/processed', split='train', normalize=True)
+    test_set  = MetaboNetDataset(processed_dir='data/processed', split='test',  normalize=True)
+
+    # Carve a validation split from train
+    val_size  = int(0.15 * len(train_set))
+    train_size = len(train_set) - val_size
+    train_set, val_set = random_split(train_set, [train_size, val_size])
+
+    train_loader = DataLoader(train_set, batch_size=config.training.batch_size,
+                              shuffle=True,  num_workers=config.training.num_workers)
+    val_loader   = DataLoader(val_set,   batch_size=config.training.batch_size,
+                              shuffle=False, num_workers=config.training.num_workers)
     
     print(f"Train set: {len(train_set)} samples")
     print(f"Val set: {len(val_set)} samples")
