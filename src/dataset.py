@@ -227,18 +227,17 @@ class MetaboNetDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         cgm = np.array(self.cgm_data[idx], dtype=np.float32)
         if self.normalize and 'cgm' in self.scalers:
-            cgm = self.scalers['cgm'].transform(cgm.reshape(-1, 1)).flatten()
+            cgm = self.scalers['cgm'].transform(cgm.reshape(1, -1)).flatten()
 
         insulin = np.array(self.insulin_data[idx], dtype=np.float32)
         if self.normalize and 'insulin' in self.scalers:
-            insulin = self.scalers['insulin'].transform(insulin.reshape(-1, 1)).flatten()
+            insulin = self.scalers['insulin'].transform(insulin.reshape(1, -1)).flatten()
 
         phys = np.array(self.physiology_data[idx], dtype=np.float32)
-        if self.normalize and 'physiology' in self.scalers:
-            if not np.isnan(phys).any():
-                phys = self.scalers['physiology'].transform(phys.reshape(1, -1)).flatten()
-            else:
-                phys = np.zeros_like(phys)  # missing wearable day → zero vector
+        if np.isnan(phys).any():
+            phys = np.zeros(phys.shape, dtype=np.float32)
+        elif self.normalize and 'physiology' in self.scalers:
+            phys = self.scalers['physiology'].transform(phys.reshape(1, -1)).flatten()
 
         row = self.metadata.iloc[idx]
         return {

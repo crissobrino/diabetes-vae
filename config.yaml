@@ -30,9 +30,9 @@ model:
 
 # Training configuration
 training:
-  batch_size: 32
+  batch_size: 64
   num_epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.0003
   weight_decay: 0.00001
   
   # KL annealing
@@ -45,7 +45,7 @@ training:
   
   # Device
   device: "cuda"
-  num_workers: 4
+  num_workers: 0
   
   # Checkpointing
   checkpoint_freq: 5  # epochs

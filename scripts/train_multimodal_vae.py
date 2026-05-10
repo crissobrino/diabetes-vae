@@ -19,7 +19,7 @@ from utils import set_seed, print_model_info, get_device, create_experiment_dir
 
 def main():
     # Configuration
-    config = Config()
+    config = Config.from_yaml('config.yaml')
     set_seed(42)
     device = get_device()
     

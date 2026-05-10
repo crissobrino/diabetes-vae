@@ -66,7 +66,7 @@ class TrainingConfig:
     
     # Device
     device: str = "cuda"
-    num_workers: int = 4
+    num_workers: int = 0
     
     # Checkpointing
     checkpoint_freq: int = 5  # epochs
