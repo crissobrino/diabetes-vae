@@ -226,3 +226,7 @@ data/processed/
 models/
 experiments/
 results/
+
+
+CLAUDE.md
+claude/
