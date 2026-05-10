@@ -12,6 +12,9 @@ from typing import Tuple, Dict, Optional
 from tqdm import tqdm
 import json
 from datetime import datetime
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend, safe for training loops
+import matplotlib.pyplot as plt
 
 
 class VAETrainer:
@@ -285,6 +288,9 @@ class VAETrainer:
             print(f"  Train - Loss: {train_metrics['loss']:.4f}, Recon: {train_metrics['recon']:.4f}, KL: {train_metrics['kl']:.4f}")
             print(f"  Val   - Loss: {val_metrics['loss']:.4f}, Recon: {val_metrics['recon']:.4f}, KL: {val_metrics['kl']:.4f}")
             
+            # Save loss plot (overwrites each epoch — open the file to see live progress)
+            self.plot_history(str(save_dir / 'loss_curves.png'))
+
             # Save checkpoint
             if (epoch + 1) % save_freq == 0:
                 checkpoint = {
@@ -310,3 +316,31 @@ class VAETrainer:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
             json.dump(self.history, f, indent=2)
+
+    def plot_history(self, path: str):
+        """Save a loss plot to disk (overwrites each epoch for a live view)."""
+        epochs = range(1, len(self.history['train_loss']) + 1)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+        axes[0].plot(epochs, self.history['train_loss'], label='train')
+        axes[0].plot(epochs, self.history['val_loss'],   label='val')
+        axes[0].set_title('Total loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].legend()
+
+        axes[1].plot(epochs, self.history['train_recon'], label='train')
+        axes[1].plot(epochs, self.history['val_recon'],   label='val')
+        axes[1].set_title('Reconstruction loss')
+        axes[1].set_xlabel('Epoch')
+        axes[1].legend()
+
+        axes[2].plot(epochs, self.history['train_kl'], label='train')
+        axes[2].plot(epochs, self.history['val_kl'],   label='val')
+        axes[2].set_title('KL divergence')
+        axes[2].set_xlabel('Epoch')
+        axes[2].legend()
+
+        fig.tight_layout()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=100)
+        plt.close(fig)
