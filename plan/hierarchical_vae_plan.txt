@@ -1,0 +1,397 @@
+HIERARCHICAL VAE — IMPLEMENTATION PLAN
+========================================
+Project: Latent Metabolic State Learning
+Dataset: MetaboNet (3,100+ patients, CGM + insulin + physiology, patient-day samples)
+Goal: Answer RQ1 (drift) and RQ2 (similarity) from the project proposal
+
+
+WHY WE NEED THIS
+----------------
+The baseline VAE and multimodal PoE VAE both encode each patient-day independently.
+There is no connection between Monday and Tuesday for the same patient. The model has
+no memory, no concept of time, and no notion of a patient across days.
+
+We confirmed this empirically: the latent trajectory plots (latent_trajectories.png)
+show pure random walks for every patient — the path from day 1 to day N has no
+coherent direction. Adjacent days are not reliably closer in latent space than random
+pairs (temporal consistency ratio near 1.0).
+
+This means we cannot currently answer RQ1 (drift) at all, because any apparent drift
+in z is noise. And RQ2 (similarity) is weakened because the per-patient representation
+is just an average of noisy independent codes rather than a learned patient summary.
+
+The hierarchical VAE solves this by introducing a SECOND latent variable w that
+operates at the weekly timescale, explicitly trained to summarise a sequence of daily
+states. The trajectory of w over time is the drift signal we need for RQ1. The w
+representation is also a principled patient embedding for RQ2.
+
+
+CONCEPTUAL STRUCTURE
+--------------------
+Current model (flat):
+
+  Day 1 → [Encoder] → z₁ → [Decoder] → reconstruction of day 1
+  Day 2 → [Encoder] → z₂ → [Decoder] → reconstruction of day 2
+  Day 3 → [Encoder] → z₃ → [Decoder] → reconstruction of day 3
+  (each day is completely independent)
+
+Hierarchical model (two levels):
+
+  Day 1 → [Day Encoder] → z₁ ─┐
+  Day 2 → [Day Encoder] → z₂ ─┤→ [Week Encoder / GRU] → w → [Week Decoder] → prior on z₁..z₇
+  Day 3 → [Day Encoder] → z₃ ─┤
+  ...                          │
+  Day 7 → [Day Encoder] → z₇ ─┘
+
+  Each z_t is decoded to reconstruct the day's data (same as before).
+  w is a compressed summary of the whole week — it is what we track over time.
+
+The key insight: z captures "what happened today" and w captures "what kind of week
+is this patient having." The hierarchy forces the model to disentangle short-term daily
+variation from longer-term metabolic state.
+
+
+ARCHITECTURE IN DETAIL
+-----------------------
+
+INPUT
+  A training sample is a window of T consecutive days for the same patient.
+  T = 7 (one week) is the natural choice given the project framing.
+  Each day has: cgm (288,), insulin (288,), physiology (5,).
+
+  Batch shape:
+    cgm:        (batch_size, T, 288)
+    insulin:    (batch_size, T, 288)
+    physiology: (batch_size, T, 5)
+
+LEVEL 1 — DAY ENCODER (reuse existing multimodal PoE encoder)
+  For each of the T days, independently:
+    mu_z_t, logvar_z_t = PoE_encoder(cgm_t, insulin_t, physiology_t)
+    z_t = reparameterize(mu_z_t, logvar_z_t)
+
+  This produces a sequence of daily latent codes: z_1, z_2, ..., z_T
+  Each z_t has dimension latent_dim_z = 8 (same as existing model).
+
+  The day encoder is the existing MultimodalVAEWithPoE encoder — we can initialise
+  it from the pretrained multimodal weights and either freeze it (two-stage training)
+  or fine-tune it jointly (end-to-end training). See TRAINING STRATEGY below.
+
+LEVEL 2 — WEEK ENCODER (new component)
+  Input: sequence of daily z codes, shape (batch_size, T, latent_dim_z)
+  Architecture: single-layer GRU
+    hidden = GRU(z_1, z_2, ..., z_T)   → takes the final hidden state
+    mu_w     = Linear(hidden, latent_dim_w)
+    logvar_w = Linear(hidden, latent_dim_w)
+    w        = reparameterize(mu_w, logvar_w)
+
+  latent_dim_w = 8 (can be tuned; same dimension as z for simplicity).
+  The GRU processes days in chronological order so temporal structure is respected.
+
+LEVEL 2 — WEEK DECODER (new component)
+  Input: w, shape (batch_size, latent_dim_w)
+  Purpose: decode w back to a prior distribution over each day's z.
+           This is what creates the hierarchy — the daily z is not pulled toward
+           N(0,I) but toward whatever the weekly context w predicts it should be.
+
+  Architecture: MLP that outputs T sets of (mu, logvar) for z
+    hidden   = MLP(w)                               → (batch_size, hidden_dim)
+    z_prior_mu     = Linear(hidden, T * latent_dim_z)  → reshape to (batch_size, T, latent_dim_z)
+    z_prior_logvar = Linear(hidden, T * latent_dim_z)  → reshape to (batch_size, T, latent_dim_z)
+
+  These (z_prior_mu, z_prior_logvar) define p(z_t | w) for each day t.
+
+LEVEL 1 — DAY DECODER (reuse existing)
+  For each day t, decode z_t back to all modalities:
+    cgm_recon_t        = CGM_decoder(z_t)
+    insulin_recon_t    = Insulin_decoder(z_t)
+    physiology_recon_t = Physiology_decoder(z_t)
+
+  This is identical to the existing multimodal decoder.
+
+
+LOSS FUNCTION
+-------------
+The hierarchical ELBO has three terms:
+
+  L = Σ_{t=1}^{T} reconstruction_loss(x_t, x_recon_t)       [1] daily reconstruction
+    - β_z * Σ_{t=1}^{T} KL(q(z_t|x_t) || p(z_t|w))          [2] daily KL
+    - β_w * KL(q(w|z_1:T) || p(w))                           [3] weekly KL
+
+Term [1]: MSE between original and reconstructed data for each day and each modality.
+  Same as the existing reconstruction loss, summed (or averaged) over T days.
+
+Term [2]: KL divergence between the daily posterior q(z_t | x_t) and the
+  w-conditioned prior p(z_t | w). This is what links the two levels.
+  In the existing model this KL is against N(0,I). Here the prior is the Gaussian
+  output by the week decoder — (z_prior_mu_t, z_prior_logvar_t).
+  If w captures the week's metabolic context well, the prior it generates will be
+  close to the actual daily posterior, making this KL small (good — efficient encoding).
+
+Term [3]: KL divergence between the weekly posterior q(w | z_1:T) and the fixed
+  prior p(w) = N(0,I). This regularises the weekly latent space.
+
+β_z and β_w are the KL weights, each annealed separately (see TRAINING STRATEGY).
+
+The analytical form of KL between two Gaussians is:
+  KL(N(μ₁,σ₁²) || N(μ₂,σ₂²)) = log(σ₂/σ₁) + (σ₁² + (μ₁-μ₂)²) / (2σ₂²) - 0.5
+  summed over all latent dimensions.
+
+This replaces the standard -0.5 * (1 + logvar - mu² - exp(logvar)) which assumed
+N(0,I) as the prior.
+
+
+DATA PIPELINE CHANGES
+---------------------
+The existing DataLoader yields individual shuffled patient-days.
+The hierarchical model needs sequences of T consecutive days per patient.
+
+New dataset class: SequenceDataset
+
+  Construction:
+    1. Load the existing processed arrays (cgm.npy, insulin.npy, physiology.npy,
+       metadata.parquet) — same files, no preprocessing changes needed.
+    2. Group samples by patient_id.
+    3. Within each patient, sort days by date.
+    4. Generate windows of T consecutive days using a sliding window with stride S.
+       Stride S=1 maximises training samples (overlapping windows).
+       Stride S=T gives non-overlapping weeks (cleaner but fewer samples).
+       Recommended: S=1 for training, S=7 for evaluation to get non-overlapping weeks.
+    5. Discard patients with fewer than T recorded days (not enough data for a window).
+
+  Each window is one sample returned by __getitem__:
+    cgm:        (T, 288)   — T days of CGM
+    insulin:    (T, 288)   — T days of insulin
+    physiology: (T, 5)     — T days of physiology
+    patient_id: scalar     — same for all T days
+    dates:      list[str]  — the T dates in order (used for evaluation)
+
+  Important: the existing MetaboNetDataset normalisation (StandardScaler per modality)
+  should still be applied, but the scalers should be fit on the full training set
+  (as currently done) — not per-window.
+
+  Missing days within a window: MetaboNet has gaps (patients miss days).
+  Two options:
+    a) Only create windows where all T days are present with no gap > 1 day.
+       Cleaner, but discards data.
+    b) Allow gaps, pass a mask to the model indicating which days are real.
+       More complex but more data-efficient.
+  Recommended: option (a) for the first implementation. Enforce that all T days
+  in a window are consecutive calendar dates (no gap).
+
+
+TRAINING STRATEGY
+-----------------
+Two valid approaches:
+
+APPROACH A — TWO-STAGE (simpler, recommended first)
+  Stage 1: Train the multimodal PoE VAE on individual days as already done.
+           Use the existing training notebook. Save best_model.pt.
+  Stage 2: Freeze the day-level encoder and decoder weights.
+           Build SequenceDataset on top of the frozen encoder's outputs:
+             - Run the frozen encoder over all training days to get z_t embeddings.
+             - Save these as numpy arrays.
+             - Train only the GRU week encoder and MLP week decoder on the z sequences.
+           This treats the daily z as fixed features and trains the upper level on top.
+
+  Advantage: simpler, faster, reuses existing trained model, easier to debug.
+  Disadvantage: the two levels are not jointly optimised. The daily z was not trained
+  to be useful for weekly aggregation, which may limit the quality of w.
+
+APPROACH B — END-TO-END (better, more principled)
+  Train all components jointly from scratch (or fine-tune from stage A weights).
+  The day encoder, day decoder, week encoder, and week decoder all receive gradients.
+  The daily KL term (Term [2]) now creates gradient flow between the two levels,
+  allowing the day encoder to adjust its z codes to be more useful for weekly aggregation.
+
+  Recommended: initialise from the pretrained multimodal weights (Approach A stage 1),
+  then fine-tune end-to-end with a small learning rate (1e-4 instead of 3e-4) to avoid
+  destroying the already-good daily representations.
+
+KL ANNEALING — TWO SCHEDULES
+  β_z: anneal from 0 → 1 over epochs 1–10 (same as existing).
+  β_w: anneal from 0 → 1 over epochs 11–25 (starts only after β_z is stable).
+  Reason: if β_w ramps up too early, the weekly KL pressure collapses w before the
+  daily representations are stable enough to provide useful input to the GRU.
+
+BEST MODEL SELECTION
+  Same rule as v2: only track best model after both KL warmup schedules complete
+  (epoch >= 25). Monitor val loss = recon + β_z*KL_z + β_w*KL_w.
+
+PRACTICAL SETTINGS
+  Window size T:       7 (one week)
+  Stride (training):   1 (overlapping windows)
+  Stride (eval):       7 (non-overlapping weeks, for clean trajectory plots)
+  latent_dim_z:        8 (unchanged)
+  latent_dim_w:        8 (start here; can try 4 or 16)
+  GRU hidden dim:      64
+  Week decoder hidden: 64
+  Batch size:          32 (smaller than before because each sample is T days)
+  Learning rate:       1e-4 (fine-tuning from pretrained weights)
+  Epochs:              100
+
+
+EVALUATION PLAN
+---------------
+All existing evaluation metrics apply. Add the following:
+
+1. W-SPACE UMAP
+   Encode all test patients using the week encoder → get w for each week.
+   Plot UMAP of w coloured by patient_id.
+   Expectation: tighter, more separated patient clusters than z-space UMAP,
+   because w explicitly summarises a patient's week rather than a single day.
+   This directly shows whether the hierarchical structure improved patient separation.
+
+2. WEEKLY TRAJECTORY PLOTS
+   For each patient, compute w(t) for each non-overlapping week.
+   Plot the sequence of w(t) through UMAP space (same as latent_trajectories.png
+   but using w instead of z, and one point per week instead of one per day).
+   Expectation: smoother, more directional paths than the z trajectories (which
+   were pure random walks). If the paths are still random, Approach B (end-to-end
+   training) or temporal regularisation on w may be needed.
+
+3. DRIFT ANALYSIS (RQ1 — requires clinical proxies)
+   For each patient, compute:
+     - Weekly displacement in w-space: ||w(t+1) - w(t)||
+     - Weekly time-in-range (TIR): fraction of CGM readings between 70-180 mg/dL
+       (computed from raw cgm.npy before normalisation)
+   Correlate the two using Spearman rank correlation across all patients and weeks.
+   A positive correlation (larger w displacement = larger TIR change) answers RQ1.
+   Report per-patient and population-level correlations.
+
+4. INTER-PATIENT SIMILARITY (RQ2 — requires clinical proxies)
+   For each patient, compute their mean w across all weeks (patient centroid in w-space).
+   Compute all pairwise Euclidean distances between patient centroids.
+   Compute all pairwise absolute differences in mean TIR.
+   Spearman rank correlation between the two matrices answers RQ2.
+   Compare this correlation to the same metric computed in z-space (baseline) to
+   quantify the improvement from the hierarchical structure.
+
+5. SILHOUETTE SCORE IN W-SPACE
+   Same as existing silhouette analysis but on w vectors (one per week per patient).
+   Compare to z-space silhouette score. Hierarchical model should score higher.
+
+6. MISSING MODALITY ROBUSTNESS IN W-SPACE
+   At test time, zero out one modality for all days in a window and measure how much
+   the resulting w deviates from the full-modality w. The PoE at the day level
+   handles individual missing days — this tests robustness at the weekly level.
+
+
+IMPLEMENTATION ORDER
+--------------------
+Follow this sequence. Each step builds on the previous one.
+
+Step 1 — SequenceDataset
+  File: src/dataset.py (add new class SequenceDataset)
+  - Load the same processed numpy arrays as MetaboNetDataset.
+  - Group by patient_id, sort by date.
+  - Generate sliding windows of T=7 consecutive days (enforce no calendar gaps).
+  - Return (T, 288), (T, 288), (T, 5) tensors per window plus patient_id and dates list.
+  - Add a parameter: stride (default 1 for training, 7 for evaluation).
+  - Write a sanity check: print number of windows, patients, and mean windows per patient.
+
+Step 2 — HierarchicalVAE model
+  File: src/models.py (add new class HierarchicalVAE)
+  - Compose the existing MultimodalVAEWithPoE as the day-level component.
+  - Add GRU week encoder (input: T x latent_dim_z, output: mu_w, logvar_w).
+  - Add MLP week decoder (input: latent_dim_w, output: T x latent_dim_z x 2 for
+    the z prior mu and logvar).
+  - forward() takes (cgm, insulin, physiology) each of shape (batch, T, dim),
+    processes each day independently through the day encoder,
+    feeds the z sequence to the GRU, samples w,
+    decodes w to z priors,
+    decodes each z_t to reconstructions.
+  - Return a dict containing: all daily reconstructions, z_t mu/logvar for all t,
+    z_prior mu/logvar for all t, w mu/logvar.
+
+Step 3 — Loss function
+  File: src/training.py (add hierarchical_vae_loss method to VAETrainer or new class)
+  - Implement KL between two arbitrary Gaussians (not just vs N(0,I)).
+  - Compute Term [1]: mean MSE across T days and all modalities.
+  - Compute Term [2]: KL(q(z_t|x_t) || p(z_t|w)) for each t, sum over T.
+  - Compute Term [3]: KL(q(w|z_1:T) || N(0,I)).
+  - Apply separate β_z and β_w annealing weights.
+  - Log all three terms separately during training (essential for debugging).
+
+Step 4 — Training script / notebook
+  File: scripts/train_hierarchical_vae_kaggle.ipynb (new Kaggle notebook)
+  - Load pretrained multimodal weights as initialisation.
+  - Instantiate SequenceDataset with stride=1.
+  - Train with two KL annealing schedules (β_z: epochs 1-10, β_w: epochs 11-25).
+  - Save checkpoints every 5 epochs, best model after epoch 25.
+  - Log recon, KL_z, KL_w separately so posterior collapse at either level is visible.
+
+Step 5 — Evaluation notebook
+  File: scripts/evaluate_hierarchical_kaggle.ipynb (new Kaggle notebook)
+  - Load trained model, instantiate SequenceDataset with stride=7 (non-overlapping).
+  - Run all existing proxy-free metrics (silhouette, temporal consistency) on w.
+  - Plot w-space UMAP and weekly trajectory plots.
+  - Compare silhouette and trajectory plots side by side with baseline z results.
+  - Once clinical proxies are computed: add drift (RQ1) and similarity (RQ2) analyses.
+
+Step 6 — Clinical proxy computation (enables RQ1 and RQ2)
+  File: scripts/preprocess_metabonet.py (extend existing preprocessor)
+  - After building cgm_arr per patient-day, compute from the RAW (un-normalised) values:
+      time_in_range (TIR):    fraction of readings in [70, 180] mg/dL
+      glucose_cv:             std / mean of CGM readings (coefficient of variation)
+      mean_glucose:           mean of CGM readings
+  - Save these as additional columns in metadata.parquet.
+  - No changes to cgm.npy — these are derived statistics only.
+  - This unlocks the full evaluation plan (drift correlation, inter-patient similarity).
+
+
+WHAT GOOD RESULTS LOOK LIKE
+-----------------------------
+After implementation, here is what success looks like for each check:
+
+Training:
+  - Recon loss decreases steadily from epoch 1.
+  - KL_z rises after β_z annealing starts, stabilises around epoch 15.
+  - KL_w rises after β_w annealing starts, stabilises around epoch 30.
+  - Neither KL collapses to 0 (that would mean posterior collapse).
+
+W-space UMAP:
+  - Patient clusters should be visibly tighter than in z-space.
+  - Patients with similar clinical profiles (once proxies are available) should
+    appear near each other.
+
+Weekly trajectory plots:
+  - Paths should be smoother than the z-space random walks.
+  - Patients with known clinical deterioration over the study period should show
+    directional drift in w-space.
+
+Silhouette score:
+  - W-space silhouette should exceed z-space silhouette.
+  - A score above 0.3 would be a meaningful result for a dataset of 3,100+ patients.
+
+Drift (RQ1):
+  - Spearman correlation between weekly w displacement and weekly TIR change
+    should be positive and statistically significant (p < 0.05).
+
+Similarity (RQ2):
+  - Spearman correlation between inter-patient w distances and inter-patient TIR
+    differences should be positive and statistically significant.
+  - This correlation should exceed the same metric in z-space, demonstrating
+    that the hierarchical structure adds value.
+
+
+POTENTIAL FAILURE MODES AND FIXES
+-----------------------------------
+Posterior collapse at the weekly level (KL_w → 0):
+  The GRU ignores its input and w is uninformative.
+  Fix: increase β_w, add a minimum KL threshold (free bits), or use a lower learning
+  rate for the week encoder.
+
+W-space still random walk:
+  The weekly aggregation didn't capture temporal structure.
+  Fix: increase window size T, use a bidirectional GRU, or add an explicit temporal
+  smoothness penalty on w (as described in improvements.txt).
+
+W-space collapses all patients together:
+  The week encoder learned a trivial constant mapping.
+  Fix: check that the day encoder is producing meaningful z codes first, verify
+  the SequenceDataset is correctly grouping consecutive days, reduce β_w.
+
+Training too slow:
+  Each sample is T=7 days of multimodal data — batch is larger.
+  Fix: reduce batch_size to 16, use gradient checkpointing, or use Approach A
+  (two-stage) so stage 2 only trains the lightweight GRU/MLP upper level.

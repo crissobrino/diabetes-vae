@@ -1,0 +1,17 @@
+IMPROVEMENTS FOR FUTURE ITERATIONS
+====================================
+
+[Training]
+- [DONE in v2] Best model selection was tracking lowest val ELBO from epoch 1, including
+  during KL annealing when beta=0. Fixed in v2: only start tracking best model after
+  warmup completes (epoch >= kl_warmup_epochs), so we always compare fully-regularised
+  models. Also added kl_w and epoch to the best model print for visibility.
+  Code: if vl < best_val and (not kl_annealing or epoch >= warmup_epochs):
+
+- Temporal regularisation: the baseline VAE encodes each day independently — consecutive
+  days for the same patient show no coherent trajectory in latent space (confirmed by
+  latent_trajectories.png). Fix: add a temporal smoothness penalty to the loss:
+    loss = recon + β·KL + γ·||z(t) - z(t-1)||²
+  This requires the DataLoader to yield consecutive-day pairs rather than shuffled
+  individual days. Weight γ controls the smoothness/reconstruction tradeoff. This is a
+  prerequisite for RQ1 (drift detection) to be meaningful.

@@ -1,0 +1,49 @@
+Project Proposal: Latent Metabolic State Learning with Variational Autoencoders
+________________________________________
+Motivation
+Standard approaches to health monitoring with wearable data focus on predicting the next measurement. We take a different angle: instead of asking what comes next, we ask what is the patient's underlying metabolic state, and has it changed? This is a representation learning problem, and variational autoencoders are the right tool for it.
+________________________________________
+Dataset: OhioT1DM + MetaboNet
+We will use two complementary datasets:
+OhioT1DM (primary development dataset) — 12 patients with type 1 diabetes, 8 weeks each, containing CGM readings every 5 minutes, insulin doses (bolus and basal), self-reported meals with carbohydrate estimates, exercise and stress logs, and wearable physiology (heart rate, skin temperature, galvanic skin response, step count). Requires a Data Use Agreement from Ohio University, free for research.
+MetaboNet (scale-up dataset) — a recently published unified collection of over 3,100 patients and 1,228 patient-years of CGM + insulin data aggregated from multiple source studies across different countries and devices. A public subset is available for immediate download at metabo-net.org with no DUA required. This is what we use to make statistically meaningful claims and to test whether the learned representations generalize beyond a small cohort.
+The two datasets together give us a development environment with rich multimodal signal (OhioT1DM) and a large-scale validation environment (MetaboNet).
+________________________________________
+Research Questions
+Two concrete questions drive the whole project:
+RQ1 — Drift: Does a patient's position in the learned latent space change meaningfully over time, and does that drift correlate with clinically observable changes in metabolic control?
+RQ2 — Similarity: Does distance between patients in the latent space reflect clinical similarity, measured by proxies such as time-in-range, glucose variability, and HbA1c where available?
+________________________________________
+Input Representation
+Each sample fed to the model represents one patient-day, consisting of three channels:
+CGM signal — 288 glucose readings at 5-minute intervals (the raw time-series of blood glucose across 24 hours).
+Insulin profile — bolus and basal insulin doses aggregated to the same 5-minute grid.
+Physiology + activity — heart rate, step count, and skin-derived signals aggregated to daily summaries (since wearable data is not always at CGM resolution).
+Missing modalities are handled explicitly — a patient who forgot to log meals or whose wearable dropped out for a day is not excluded. The model is designed to be robust to this, which is a methodological contribution in itself.
+________________________________________
+Model Structure
+Baseline: standard VAE on CGM only
+A 1D convolutional encoder reads the 288-point glucose sequence and outputs a mean μ and variance σ in a low-dimensional latent space (dimension 8–16). The decoder reconstructs the glucose sequence from a sample z ~ N(μ, σ). Training minimizes the standard ELBO loss (reconstruction + KL divergence). This establishes what a plain VAE captures about daily glucose patterns.
+Modified: multimodal VAE with Product-of-Experts
+Each modality gets its own encoder — a 1D CNN for the CGM sequence, a smaller network for the insulin profile, and a simple MLP for the daily physiology summary. Each encoder outputs its own (μ, σ) estimate of the latent state. These are combined using a Product-of-Experts (PoE) fusion, which yields a joint posterior that is sharper than any individual modality alone and degrades gracefully when a modality is missing (simply drop that expert from the product). The decoder reconstructs all available modalities from the joint z.
+The key property of PoE for our use case: if heart rate and glucose both independently point toward the same latent region, the joint posterior concentrates there. If one modality is missing, the others still produce a valid posterior. This is the principled missing data handling that a concatenation approach cannot provide.
+Optional extension (if time allows): hierarchical structure
+Add a second latent level above the daily z — a per-patient, per-week latent variable w that aggregates across daily states. The trajectory of w over weeks is the drift signal for RQ1. This is a natural hierarchical VAE and connects directly to the health monitoring framing.
+________________________________________
+Training Strategy
+KL annealing during early training to prevent posterior collapse (a well-known failure mode where the encoder ignores the input and the latent space collapses to the prior). Separate monitoring of reconstruction loss and KL term throughout training. Multiple random seeds per configuration to report mean ± standard deviation on all metrics. The RTX 5070 means full hyperparameter sweeps are feasible within the one-month timeline.
+________________________________________
+Evaluation
+Because we have no ground truth for "metabolic state," evaluation is proxy-based — but the proxies are clinically meaningful:
+Latent space structure — UMAP visualization of the latent space colored by time-in-range, glucose variability (coefficient of variation), and patient ID. A good representation should cluster similar days together without being given these labels.
+Drift detection — For each patient, plot their latent trajectory z(t) over 8 weeks. Correlate displacement in latent space with changes in weekly time-in-range. If drift in z tracks real metabolic change, RQ1 is answered positively.
+Inter-patient similarity — Compute pairwise distances in latent space and compare with pairwise differences in clinical proxies (time-in-range, mean glucose, variability). A meaningful latent space should produce a positive rank correlation.
+Missing modality robustness — Systematically mask modalities at test time and measure reconstruction quality and latent space stability. The multimodal VAE should degrade more gracefully than modality concatenation baselines.
+Baseline comparison — All metrics are reported for both the baseline VAE (CGM only) and the multimodal VAE, with the gap between them as the main result.
+Timeline
+Week	Deliverable
+1	Data access, preprocessing pipeline, baseline VAE training
+2	Multimodal VAE implementation, stable training
+3	Experiments, latent space analysis, missing modality tests
+4	Write-up, figures, comparison tables
+
