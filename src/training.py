@@ -61,9 +61,10 @@ class VAETrainer:
         # Reconstruction loss (MSE)
         recon_loss = nn.MSELoss(reduction='mean')(recon, target)
         
-        # KL divergence: 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        # KL divergence with free bits (min 0.5 nats/dim prevents posterior collapse)
         logvar = logvar.clamp(-10, 10)
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        kl_loss = torch.clamp(kl_per_dim, min=0.5).mean()
         
         total_loss = recon_loss + kl_weight * kl_loss
         
@@ -92,9 +93,10 @@ class VAETrainer:
         mu = outputs['mu']
         logvar = outputs['logvar']
         
-        # KL divergence
+        # KL divergence with free bits (min 0.5 nats/dim prevents posterior collapse)
         logvar = logvar.clamp(-10, 10)
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        kl_loss = torch.clamp(kl_per_dim, min=0.5).mean()
         
         # Reconstruction losses for available modalities
         recon_loss = torch.tensor(0.0, device=mu.device)

@@ -78,12 +78,11 @@ class ConvDecoder1D(nn.Module):
         self.latent_dim = latent_dim
         self.channels = channels
         
-        # Calculate expected flattened size for reconstruction
-        # This is a simplified version; in practice, you'd want to match the encoder
+        # FC expands z to full sequence length — symmetric with the encoder.
+        # Using output_length (not output_length // 2^n) ensures every time step
+        # is decoded from learned weights rather than zero-padded.
         self.conv_output_channels = channels[0]
-        self.conv_output_length = output_length // (2 ** len(channels))
-        if self.conv_output_length == 0:
-            self.conv_output_length = output_length
+        self.conv_output_length = output_length
         self.fc_output_size = self.conv_output_channels * self.conv_output_length
         
         # FC layer from latent to conv input
